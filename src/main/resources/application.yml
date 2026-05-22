@@ -49,6 +49,30 @@ management:
   health:
     circuitbreakers.enabled: true
 
+  # Observability — OpenTelemetry, wired but OFF by default so the app boots with
+  # no collector present. Flip it on by setting OTEL_EXPORTER_OTLP_ENDPOINT to an
+  # OTLP collector (OTel Collector, Grafana Alloy, ...) plus TRACING_ENABLED=true
+  # and/or OTEL_METRICS_ENABLED=true. Traces are produced via Micrometer Tracing's
+  # OTel bridge and shipped over OTLP; metrics are pushed over OTLP. From the
+  # collector they fan out to a visualization stack — Grafana (Tempo + Prometheus
+  # + Loki) or the Elastic Stack (ELK) — which is the only piece not bundled here.
+  opentelemetry:
+    resource-attributes:
+      service.name: ${spring.application.name}
+      service.version: ${spring.application.version:1.0.0}
+  tracing:
+    enabled: ${TRACING_ENABLED:false}
+    sampling:
+      probability: ${TRACING_SAMPLE_PROBABILITY:1.0}
+  otlp:
+    tracing:
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4318}/v1/traces
+    metrics:
+      export:
+        enabled: ${OTEL_METRICS_ENABLED:false}
+        url: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4318}/v1/metrics
+        step: ${OTEL_METRICS_STEP:30s}
+
 # Treasury Reporting Rates of Exchange API
 treasury:
   base-url: https://api.fiscaldata.treasury.gov

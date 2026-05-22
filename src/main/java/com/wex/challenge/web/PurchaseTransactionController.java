@@ -50,7 +50,7 @@ public class PurchaseTransactionController {
             @ApiResponse(responseCode = "400", description = "Validation error")
     })
     @PostMapping(consumes = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<PurchaseTransactionResponse> create(
+    public ResponseEntity<Void> create(
             @Valid @RequestBody CreatePurchaseTransactionRequest request) {
 
         PurchaseTransaction created = purchaseService.create(
@@ -63,7 +63,7 @@ public class PurchaseTransactionController {
                 .buildAndExpand(created.getId())
                 .toUri();
 
-        return ResponseEntity.created(location).body(PurchaseTransactionResponse.from(created));
+        return ResponseEntity.created(location).build();
     }
 
     @Operation(summary = "Get the original USD purchase transaction by id")

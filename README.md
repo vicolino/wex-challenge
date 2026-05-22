@@ -20,7 +20,8 @@ Built for the WEX SDE 4 (R21202) take-home challenge.
 | Migrations      | Flyway (`validate` everywhere — Hibernate never issues DDL)        |
 | HTTP client     | Spring HTTP Interface (`@HttpExchange`) over `RestClient`           |
 | API docs        | `springdoc-openapi` (Swagger UI at `/swagger-ui.html`)              |
-| Tests           | JUnit 5, Mockito, AssertJ, MockMvc, WireMock                        |
+| Observability   | Micrometer + OpenTelemetry over OTLP (traces + metrics), wired off-by-default |
+| Tests           | JUnit 5, Mockito, AssertJ; sliced integration (`@WebMvcTest` + `RestTestClient` + `@MockitoBean`, `MockRestServiceServer`, `@DataJpaTest`) |
 | Build / package | Gradle 9.5 (Groovy DSL), executable Spring Boot jar, Dockerfile     |
 
 ---
@@ -67,25 +68,41 @@ docker run --rm -p 8080:8080 wex-challenge
 
 ### Run the tests
 
-Tests are split into three Gradle JVM test suites, each with its own source
-set under `src/`:
+Tests are split into Gradle JVM test suites, each with its own source set under
+`src/`. Shared test-data builders live in a `testFixtures` source set so both
+the unit suite and the integration slices reuse them:
 
-| Suite              | Source set               | What it covers                                                |
-| ------------------ | ------------------------ | ------------------------------------------------------------- |
-| `test`             | `src/test/`              | Fast unit tests (domain, services, controller with MockMvc).  |
-| `architectureTest` | `src/test-architecture/` | ArchUnit invariants over the production code.                 |
-| `integrationTest`  | `src/test-integration/`  | `@SpringBootTest` end-to-end against H2 and a WireMock'd Treasury. |
+| Suite              | Source set               | What it covers                                                          |
+| ------------------ | ------------------------ | ---------------------------------------------------------------------- |
+| `test`             | `src/test/`              | Pure unit tests only — no Spring context, no I/O (domain, services with mocked collaborators, config wiring, the exception handler). |
+| `architectureTest` | `src/test-architecture/` | ArchUnit invariants over the production code.                          |
+| `integrationTest`  | `src/test-integration/`  | Integration slices — one boundary each, no `@SpringBootTest` (web, client, database). |
+| _(fixtures)_       | `src/test-fixtures/`     | Shared test-data builders consumed by both `test` and `integrationTest`. |
 
 ```bash
-./gradlew test                # unit suite only
+./gradlew test                # unit suite
 ./gradlew architectureTest    # ArchUnit suite
-./gradlew integrationTest     # end-to-end suite
+./gradlew integrationTest     # integration slices (web, client, db)
 ./gradlew allTests            # all three, in order: test → architecture → integration
 ./gradlew check               # allTests + coverage verification + reports
 ```
 
 The suites run sequentially (`mustRunAfter`) so a broken architectural
 invariant or a failing integration is surfaced *after* unit tests pass.
+
+**Integration by slices, not end-to-end.** There is deliberately no
+`@SpringBootTest` that boots the whole application. Each integration test
+(suffixed `IT`) exercises exactly one layer in isolation, which keeps them fast
+and pinpoints failures to a single boundary:
+
+| Layer    | Slice (`src/test-integration/`)                    | What it proves                                                              |
+| -------- | -------------------------------------------------- | -------------------------------------------------------------------------- |
+| Web      | `@WebMvcTest` + `RestTestClient` (service `@MockitoBean`) | Routing, validation, serialization, status codes, the RFC 7807 error model. |
+| Client   | `RestClient` + `MockRestServiceServer` (no Spring ctx) | URL/JSON handling and timeout/error → exception mapping for the HTTP Interface client. |
+| Database | `@DataJpaTest` (`replace = NONE`) + H2 + Flyway    | The JPA mapping matches the real migrated schema (`ddl-auto: validate`) and round-trips. |
+
+The web slices share a small `WebTestBase` that holds the auto-configured
+`MockMvc`; each test drives it through Spring 7's fluent `RestTestClient`.
 
 ### Code coverage (JaCoCo)
 
@@ -105,21 +122,25 @@ Verification thresholds (`gradle check` enforces these):
 | Branch       | 100 %   |
 | Instruction  | 100 %   |
 
-The only class excluded from coverage is the `WexChallengeApplication`
-bootstrapper (its `main()` just delegates to `SpringApplication.run`). Every
-other class is exercised by tests, including configuration beans, DTO
-factories, exception types, and the defensive null-guard branches that
-ordinary HTTP traffic doesn't reach.
+Three classes are excluded from coverage — all pure declarative wiring with no
+branches or logic worth asserting in isolation, and (now that the suite is
+sliced rather than booting the whole app) nothing instantiates them:
+`WexChallengeApplication` (its `main()` delegates to `SpringApplication.run`),
+`OpenApiConfig` (builds static springdoc metadata) and `CacheConfig` (an empty
+`@EnableCaching` marker). `RestClientConfig` — which has real SSL/truststore
+logic — is covered by a focused unit test, and every other class, including DTO
+factories, exception types and the defensive null-guard branches that ordinary
+HTTP traffic doesn't reach, is exercised by tests.
 
 Current numbers (`./gradlew jacocoTestReport`):
 
 | Counter      | Covered  |
 | ------------ | -------- |
-| Line         | 192/192 (100 %) |
+| Line         | 196/196 (100 %) |
 | Branch       | 28/28 (100 %)   |
-| Instruction  | 852/852 (100 %) |
-| Method       | 61/61 (100 %)   |
-| Class        | 20/20 (100 %)   |
+| Instruction  | 845/845 (100 %) |
+| Method       | 60/60 (100 %)   |
+| Class        | 18/18 (100 %)   |
 
 ---
 
@@ -152,16 +173,13 @@ Field rules:
 
 Response `201 Created`:
 
-```json
-{
-  "id": "11111111-1111-1111-1111-111111111111",
-  "description": "Office supplies",
-  "transactionDate": "2025-12-01",
-  "purchaseAmount": 99.99
-}
+Empty body. The `Location` header points to the created resource, including the generated id:
+
+```
+Location: /api/v1/purchase-transactions/11111111-1111-1111-1111-111111111111
 ```
 
-The `Location` header points to the created resource.
+Fetch the resource with `GET /api/v1/purchase-transactions/{id}`.
 
 ### `GET /api/v1/purchase-transactions/{id}`
 
@@ -263,6 +281,50 @@ The cache advisor is given `Ordered.HIGHEST_PRECEDENCE` so cache hits
 short-circuit the resilience chain entirely (no retry budget or breaker stats
 consumed on a hit).
 
+### Observability (OpenTelemetry — wired, vendor-neutral)
+
+The three pillars are instrumented with **Micrometer + OpenTelemetry**, exported
+over **OTLP**, and **off by default** so the service boots with no collector
+present. There is no visualization backend bundled — that is intentionally the
+one pluggable piece (see below).
+
+| Signal      | How it's produced                                                            | Exported via                         |
+| ----------- | ---------------------------------------------------------------------------- | ------------------------------------ |
+| **Metrics** | Micrometer (JVM, HTTP server, cache, Resilience4j, HikariCP) via Actuator    | `micrometer-registry-otlp` → OTLP    |
+| **Traces**  | Micrometer Tracing with the OpenTelemetry bridge (auto context propagation)  | `opentelemetry-exporter-otlp` → OTLP |
+| **Logs**    | Logback to stdout; correlated with `traceId`/`spanId` once tracing is on     | container stdout → log shipper       |
+
+Everything is driven by env vars — point them at a collector to light it up:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
+TRACING_ENABLED=true \
+OTEL_METRICS_ENABLED=true \
+java -jar build/libs/wex-challenge.jar
+```
+
+| Variable                      | Default                  | Effect                                  |
+| ----------------------------- | ------------------------ | --------------------------------------- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318`  | Base OTLP endpoint for traces + metrics |
+| `TRACING_ENABLED`             | `false`                  | Turns span export on                    |
+| `OTEL_METRICS_ENABLED`        | `false`                  | Turns OTLP metric push on               |
+| `TRACING_SAMPLE_PROBABILITY`  | `1.0`                    | Trace sampling rate                     |
+| `OTEL_METRICS_STEP`           | `30s`                    | Metric push interval                    |
+
+**Why "prepared" and not "running":** because the *visualization* layer is a
+deployment choice, not an application one. The app speaks OTLP — the open
+standard — so it drops straight into either of the usual stacks without code
+changes:
+
+- **Grafana stack** — OTel Collector → **Tempo** (traces) + **Prometheus**/Mimir
+  (metrics) + **Loki** (logs), all viewed in Grafana.
+- **Elastic / ELK** — OTel Collector → Elasticsearch, explored in Kibana (APM).
+
+Adding it is purely ops: run an OpenTelemetry Collector (or Grafana Alloy) as a
+sidecar, set `OTEL_EXPORTER_OTLP_ENDPOINT`, and the signals already emitted here
+start flowing. Until then, metrics remain available for scraping/inspection at
+`GET /actuator/metrics`.
+
 ### Architecture tests (ArchUnit)
 
 `LayeredArchitectureTest` enforces, at compile-time-of-tests, that:
@@ -339,12 +401,37 @@ transport concerns. `TreasuryExchangeRateClient` keeps the business mapping
 (filter construction, 6-month guard, error translation) plus the cache and
 resilience annotations, and simply delegates the HTTP call to the interface.
 
-### Why WireMock
+### Why MockRestServiceServer for the client slice
 
-The integration tests need a deterministic Treasury API. WireMock runs in-process
-on a random port; `@DynamicPropertySource` rewires
-`treasury.base-url` to point at it so the production client code is exercised
-end to end without ever calling the public API.
+The client slice needs a deterministic Treasury API. `TreasuryExchangeRateClientIT`
+(via `HttpExchangeClientTestBase`) binds Spring's `MockRestServiceServer` to a
+real `RestClient` and creates the `@HttpExchange` proxy over it. This exercises
+the actual HTTP path — URL building, JSON parsing and the timeout/5xx → exception
+translation — without a Spring context, without WireMock, and without ever
+calling the public API. Using the framework's own client-side mock keeps the
+slice dependency-light and is the same pattern reused for any future HTTP client.
+
+### Why a shared `testFixtures` source set
+
+The test-data builders (`PurchaseTransactionFixture`, `ExchangeRateFixture`,
+`ConvertedPurchaseFixture`) are needed by both the unit suite (`src/test/`) and
+the integration slices (`src/test-integration/`). Rather than duplicating them
+or letting one suite reach into the other's source set, they live in their own
+`src/test-fixtures/` source set (Gradle's `java-test-fixtures` plugin). Both
+suites declare `testFixtures(project())`:
+
+```groovy
+plugins { id 'java-test-fixtures' }
+
+testing.suites {
+    test            { dependencies { implementation testFixtures(project()) } }
+    integrationTest { dependencies { implementation testFixtures(project()) } }
+}
+```
+
+The fixtures depend only on production types, so they compile against `main`
+with no test-framework leakage, and they are excluded from coverage (they are
+test scaffolding, not production code).
 
 ### Error model
 
@@ -398,9 +485,13 @@ src/main/resources/
 └── db/migration/
     └── V1__create_purchase_transactions.sql
 
-src/test/java/                       Unit suite
+src/test/java/                       Unit tests only (no Spring context, no I/O)
+src/test-fixtures/java/              Shared test-data builders (java-test-fixtures)
 src/test-architecture/java/          ArchUnit suite (LayeredArchitectureTest)
-src/test-integration/java/           @SpringBootTest suite (test profile, in-mem H2)
+src/test-integration/java/           Integration slices (…IT): @WebMvcTest, client, @DataJpaTest
+    ├── web/         WebTestBase + PurchaseTransactionControllerIT (RestTestClient)
+    ├── service/     HttpExchangeClientTestBase + TreasuryExchangeRateClientIT (MockRestServiceServer)
+    └── persistence/ PurchaseTransactionRepositoryIT (@DataJpaTest, H2 + Flyway)
 ```
 
 ---
@@ -410,8 +501,11 @@ src/test-integration/java/           @SpringBootTest suite (test profile, in-mem
 | Suite              | Test                                       | What it proves                                                   |
 | ------------------ | ------------------------------------------ | ---------------------------------------------------------------- |
 | `test`             | `PurchaseTransactionTest`                  | Validation rules and HALF_UP rounding at boundaries.             |
+| `test`             | `PurchaseTransactionServiceTest`           | Persistence orchestration and not-found handling (mocked repo).  |
 | `test`             | `CurrencyConversionServiceTest`            | Math, 6-month window computation, error paths.                   |
-| `test`             | `TreasuryExchangeRateClientTest` (WireMock)| URL, query parameters, empty data, 5xx, malformed body.          |
-| `test`             | `PurchaseTransactionControllerTest`        | Request/response shape and validation behaviour via MockMvc.     |
+| `test`             | `RestClientConfigTest`                     | Treasury `RestClient`/proxy wiring incl. SSL truststore setup.   |
+| `test`             | `GlobalExceptionHandlerTest`               | RFC 7807 problem-detail mapping fallback.                        |
 | `architectureTest` | `LayeredArchitectureTest`                  | Layering invariants enforced via ArchUnit.                       |
-| `integrationTest`  | `PurchaseTransactionIntegrationTest`       | Full `@SpringBootTest` stack against a fake Treasury (WireMock). |
+| `integrationTest`  | `PurchaseTransactionControllerIT`          | Web slice: routing, validation, status codes, error model via `@WebMvcTest` + `RestTestClient`. |
+| `integrationTest`  | `TreasuryExchangeRateClientIT`             | Client slice (`MockRestServiceServer`): rate parsing, empty/null data, 5xx, malformed body. |
+| `integrationTest`  | `PurchaseTransactionRepositoryIT`          | DB slice: JPA mapping vs. migrated schema + round-trip on H2.    |

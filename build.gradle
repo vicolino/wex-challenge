@@ -1,5 +1,6 @@
 plugins {
     id 'java'
+    id 'java-test-fixtures'
     id 'jvm-test-suite'
     id 'jacoco'
     id 'org.springframework.boot' version '4.0.6'
@@ -16,13 +17,22 @@ java {
     }
 }
 
+// The java-test-fixtures plugin defaults the source set to src/testFixtures/.
+// Point it at src/test-fixtures/ so the folder lines up with the hyphenated
+// sibling source sets (src/test-architecture, src/test-integration).
+sourceSets {
+    testFixtures {
+        java.srcDirs = ['src/test-fixtures/java']
+        resources.srcDirs = ['src/test-fixtures/resources']
+    }
+}
+
 repositories {
     mavenCentral()
 }
 
 ext {
     springdocVersion = '3.0.3'
-    wiremockVersion = '3.9.2'
     resilience4jVersion = '2.3.0'
     archunitVersion = '1.4.1'
 }
@@ -42,8 +52,18 @@ dependencies {
     runtimeOnly 'org.postgresql:postgresql'   // dev / hom / prod
     runtimeOnly 'com.h2database:h2'            // local / test
 
-    // Actuator: /actuator/health for ops
+    // Actuator: /actuator/health, /actuator/metrics, /actuator/prometheus for ops
     implementation 'org.springframework.boot:spring-boot-starter-actuator'
+
+    // Observability — OpenTelemetry, wired but inert by default (no collector
+    // required to boot). Traces go through Micrometer Tracing's OTel bridge and
+    // are shipped over OTLP; metrics are exported over OTLP via Micrometer's OTLP
+    // registry. Point OTEL_EXPORTER_OTLP_ENDPOINT at any OTLP collector (OTel
+    // Collector, Grafana Alloy, ...) to light up traces + metrics in Tempo /
+    // Prometheus / Loki / ELK. Versions are managed by the Spring Boot BOM.
+    implementation 'io.micrometer:micrometer-tracing-bridge-otel'
+    implementation 'io.opentelemetry:opentelemetry-exporter-otlp'
+    implementation 'io.micrometer:micrometer-registry-otlp'
 
     // Caching: Caffeine for Treasury exchange-rate responses
     implementation 'org.springframework.boot:spring-boot-starter-cache'
@@ -63,11 +83,19 @@ dependencies {
 }
 
 // ---------------------------------------------------------------------------
-// Test suites — one source set per category, matching the smartquote-ms layout.
+// Test suites — one source set per category.
 //
-//   src/test/                 → fast unit tests (no Spring, no IO)
-//   src/test-architecture/    → ArchUnit invariants over the production code
-//   src/test-integration/     → @SpringBootTest end-to-end against WireMock + H2
+//   src/test/                 → pure unit tests only (no Spring context, no I/O):
+//                               domain, services (mocked collaborators), config
+//                               wiring, the exception handler.
+//   src/testFixtures/         → shared test data builders, reused by both the
+//                               unit suite and the integration slices.
+//   src/test-architecture/    → ArchUnit invariants over the production code.
+//   src/test-integration/     → integration slices, one boundary each, no
+//                               end-to-end @SpringBootTest:
+//                                 web → @WebMvcTest + RestTestClient (service mocked)
+//                                 client → RestClient against MockRestServiceServer
+//                                 db → @DataJpaTest against H2 + Flyway
 //
 // The order of execution is: test → architectureTest → integrationTest, so a
 // broken invariant or failed integration is surfaced *after* unit tests pass.
@@ -79,10 +107,7 @@ testing {
             useJUnitJupiter()
             dependencies {
                 implementation 'org.springframework.boot:spring-boot-starter-test'
-                // Spring Boot 4 split the MVC test slice (@WebMvcTest, MockMvc)
-                // into its own starter.
-                implementation 'org.springframework.boot:spring-boot-starter-webmvc-test'
-                implementation "org.wiremock:wiremock-standalone:${wiremockVersion}"
+                implementation testFixtures(project())
             }
         }
 
@@ -106,10 +131,15 @@ testing {
             }
             dependencies {
                 implementation project()
+                implementation testFixtures(project())
                 implementation 'org.springframework.boot:spring-boot-starter-test'
+                // Web slice (@WebMvcTest, MockMvc, RestTestClient). Spring Boot 4
+                // split the MVC test slice into its own starter.
                 implementation 'org.springframework.boot:spring-boot-starter-webmvc-test'
-                implementation 'org.springframework.boot:spring-boot-starter-web'
-                implementation "org.wiremock:wiremock-standalone:${wiremockVersion}"
+                // Persistence slice (@DataJpaTest), likewise its own starter in SB4.
+                implementation 'org.springframework.boot:spring-boot-starter-data-jpa-test'
+                // Client slice stubs the Treasury HTTP exchange with Spring's
+                // MockRestServiceServer (from spring-boot-starter-test) — no WireMock.
             }
         }
     }
@@ -150,12 +180,20 @@ jacoco {
     toolVersion = '0.8.13'
 }
 
-// We chase 100% coverage end-to-end. The application bootstrapper is the
-// only class with no executable code worth asserting — its main() runs the
-// SpringApplication and is exercised implicitly by the integration tests'
-// context load.
+// We chase 100% coverage over code with behaviour. A handful of classes are
+// pure declarative wiring with no branches or logic worth asserting in
+// isolation, and — now that the suite is sliced rather than booting the whole
+// app end-to-end — nothing instantiates them. Excluding them keeps the gate
+// honest instead of forcing a full-context test back in just to colour them in:
+//   - WexChallengeApplication  → main() bootstraps SpringApplication
+//   - OpenApiConfig            → builds static springdoc metadata (title/license)
+//   - CacheConfig              → empty @EnableCaching marker
+// (RestClientConfig has real SSL/truststore logic and is covered by a unit test;
+//  TreasuryProperties is a config record covered by that same test.)
 def coverageExclusions = [
-        'com/wex/challenge/WexChallengeApplication.class'
+        'com/wex/challenge/WexChallengeApplication.class',
+        'com/wex/challenge/config/OpenApiConfig.class',
+        'com/wex/challenge/config/CacheConfig.class'
 ]
 
 jacocoTestReport {
