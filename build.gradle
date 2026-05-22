@@ -1,0 +1,238 @@
+plugins {
+    id 'java'
+    id 'jvm-test-suite'
+    id 'jacoco'
+    id 'org.springframework.boot' version '4.0.6'
+    id 'io.spring.dependency-management' version '1.1.7'
+}
+
+group = 'com.wex'
+version = '1.0.0'
+description = 'WEX Corporate Payments – Purchase Transactions with Currency Conversion'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+ext {
+    springdocVersion = '3.0.3'
+    wiremockVersion = '3.9.2'
+    resilience4jVersion = '2.3.0'
+    archunitVersion = '1.4.1'
+}
+
+dependencies {
+    // Web + Validation
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+
+    // Persistence + schema migrations.
+    // Spring Boot 4 moved Flyway auto-configuration out of the monolithic
+    // spring-boot-autoconfigure into the dedicated spring-boot-flyway module,
+    // which also pulls flyway-core.
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.springframework.boot:spring-boot-flyway'
+    runtimeOnly 'org.flywaydb:flyway-database-postgresql'
+    runtimeOnly 'org.postgresql:postgresql'   // dev / hom / prod
+    runtimeOnly 'com.h2database:h2'            // local / test
+
+    // Actuator: /actuator/health for ops
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+
+    // Caching: Caffeine for Treasury exchange-rate responses
+    implementation 'org.springframework.boot:spring-boot-starter-cache'
+    implementation 'com.github.ben-manes.caffeine:caffeine'
+
+    // Resilience: retry + circuit breaker around the Treasury client.
+    // Spring Boot 4 removed spring-boot-starter-aop, so we bring the AspectJ
+    // weaver (required by Resilience4j's @Aspect-based annotations) directly.
+    implementation "io.github.resilience4j:resilience4j-spring-boot3:${resilience4jVersion}"
+    implementation "io.github.resilience4j:resilience4j-reactor:${resilience4jVersion}"
+    implementation "io.github.resilience4j:resilience4j-micrometer:${resilience4jVersion}"
+    implementation 'org.springframework:spring-aspects'
+    implementation 'org.aspectj:aspectjweaver'
+
+    // OpenAPI / Swagger UI
+    implementation "org.springdoc:springdoc-openapi-starter-webmvc-ui:${springdocVersion}"
+}
+
+// ---------------------------------------------------------------------------
+// Test suites — one source set per category, matching the smartquote-ms layout.
+//
+//   src/test/                 → fast unit tests (no Spring, no IO)
+//   src/test-architecture/    → ArchUnit invariants over the production code
+//   src/test-integration/     → @SpringBootTest end-to-end against WireMock + H2
+//
+// The order of execution is: test → architectureTest → integrationTest, so a
+// broken invariant or failed integration is surfaced *after* unit tests pass.
+// `gradle check` runs all three; `gradle allTests` is a convenience alias.
+// ---------------------------------------------------------------------------
+testing {
+    suites {
+        test {
+            useJUnitJupiter()
+            dependencies {
+                implementation 'org.springframework.boot:spring-boot-starter-test'
+                // Spring Boot 4 split the MVC test slice (@WebMvcTest, MockMvc)
+                // into its own starter.
+                implementation 'org.springframework.boot:spring-boot-starter-webmvc-test'
+                implementation "org.wiremock:wiremock-standalone:${wiremockVersion}"
+            }
+        }
+
+        architectureTest(JvmTestSuite) {
+            useJUnitJupiter()
+            sources {
+                java.srcDirs = ['src/test-architecture/java']
+                resources.srcDirs = ['src/test-architecture/resources']
+            }
+            dependencies {
+                implementation project()
+                implementation "com.tngtech.archunit:archunit-junit5:${archunitVersion}"
+            }
+        }
+
+        integrationTest(JvmTestSuite) {
+            useJUnitJupiter()
+            sources {
+                java.srcDirs = ['src/test-integration/java']
+                resources.srcDirs = ['src/test-integration/resources']
+            }
+            dependencies {
+                implementation project()
+                implementation 'org.springframework.boot:spring-boot-starter-test'
+                implementation 'org.springframework.boot:spring-boot-starter-webmvc-test'
+                implementation 'org.springframework.boot:spring-boot-starter-web'
+                implementation "org.wiremock:wiremock-standalone:${wiremockVersion}"
+            }
+        }
+    }
+}
+
+configurations {
+    architectureTestImplementation.extendsFrom implementation
+    integrationTestImplementation.extendsFrom implementation
+}
+
+tasks.named('architectureTest') { mustRunAfter('test') }
+tasks.named('integrationTest') { mustRunAfter('architectureTest') }
+
+tasks.named('check') {
+    dependsOn testing.suites.named('architectureTest')
+    dependsOn testing.suites.named('integrationTest')
+}
+
+tasks.register('allTests') {
+    group = 'verification'
+    description = 'Runs unit, architecture and integration test suites in order.'
+    dependsOn 'test', 'architectureTest', 'integrationTest'
+}
+
+// ---------------------------------------------------------------------------
+// JaCoCo — code coverage aggregated across all three test suites.
+//
+//   ./gradlew jacocoTestReport               → HTML report at
+//                                              build/reports/jacoco/test/html/index.html
+//   ./gradlew jacocoTestCoverageVerification → fails if thresholds aren't met
+//   ./gradlew check                          → runs all suites + verification
+//
+// Classes excluded from coverage have no behaviour worth testing in isolation
+// (the application bootstrapper, immutable DTOs, OpenAPI config) and would
+// drag the metric down for no signal.
+// ---------------------------------------------------------------------------
+jacoco {
+    toolVersion = '0.8.13'
+}
+
+// We chase 100% coverage end-to-end. The application bootstrapper is the
+// only class with no executable code worth asserting — its main() runs the
+// SpringApplication and is exercised implicitly by the integration tests'
+// context load.
+def coverageExclusions = [
+        'com/wex/challenge/WexChallengeApplication.class'
+]
+
+jacocoTestReport {
+    // Aggregate the .exec data emitted by every test suite into one report.
+    dependsOn 'test', 'architectureTest', 'integrationTest'
+    executionData fileTree(layout.buildDirectory).include('jacoco/*.exec')
+
+    reports {
+        xml.required = true
+        html.required = true
+        html.outputLocation = layout.buildDirectory.dir('reports/jacoco/test/html')
+    }
+
+    afterEvaluate {
+        classDirectories.setFrom(files(classDirectories.files.collect {
+            fileTree(dir: it, exclude: coverageExclusions)
+        }))
+    }
+}
+
+jacocoTestCoverageVerification {
+    dependsOn 'test', 'architectureTest', 'integrationTest'
+    executionData fileTree(layout.buildDirectory).include('jacoco/*.exec')
+
+    // Coverage gate is set at 100% — if a future change drops any of the three
+    // counters below 1.00, `./gradlew check` fails. The bootstrapper is the
+    // only class excluded; everything else is exercised by tests.
+    violationRules {
+        rule {
+            limit {
+                counter = 'LINE'
+                value = 'COVEREDRATIO'
+                minimum = 1.00
+            }
+            limit {
+                counter = 'BRANCH'
+                value = 'COVEREDRATIO'
+                minimum = 1.00
+            }
+            limit {
+                counter = 'INSTRUCTION'
+                value = 'COVEREDRATIO'
+                minimum = 1.00
+            }
+        }
+    }
+
+    afterEvaluate {
+        classDirectories.setFrom(files(classDirectories.files.collect {
+            fileTree(dir: it, exclude: coverageExclusions)
+        }))
+    }
+}
+
+// Fail the build on missing coverage as part of `check`.
+tasks.named('check') {
+    dependsOn 'jacocoTestCoverageVerification'
+    // Always produce the HTML/XML report on check, even if verification passes.
+    finalizedBy 'jacocoTestReport'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 21
+    options.compilerArgs.add('-parameters')
+}
+
+tasks.withType(Test).configureEach {
+    forkEvery = 0
+    maxParallelForks = 1
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        showStandardStreams = false
+    }
+}
+
+bootJar {
+    archiveFileName = 'wex-challenge.jar'
+}
+
+

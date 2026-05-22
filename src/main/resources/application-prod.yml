@@ -1,0 +1,19 @@
+# Production environment: PostgreSQL. All connection details come from the
+# environment; no defaults, so a misconfigured deploy fails fast at startup.
+#
+# Operational hardening for prod: the H2 console is never on the classpath here,
+# health details are hidden, and SQL is never logged.
+spring:
+  datasource:
+    url: ${POSTGRES_URL}
+    username: ${POSTGRES_USER}
+    password: ${POSTGRES_PASSWORD}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: ${DB_POOL_MAX_SIZE:10}
+      minimum-idle: ${DB_POOL_MIN_IDLE:2}
+
+management:
+  endpoint:
+    health:
+      show-details: never

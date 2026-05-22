@@ -1,0 +1,8 @@
+# Dev environment: PostgreSQL. Connection details come from the environment so
+# nothing sensitive is committed; the defaults target a local docker-compose.
+spring:
+  datasource:
+    url: ${POSTGRES_URL:jdbc:postgresql://localhost:5432/wex_dev}
+    username: ${POSTGRES_USER:wex}
+    password: ${POSTGRES_PASSWORD:wex}
+    driver-class-name: org.postgresql.Driver

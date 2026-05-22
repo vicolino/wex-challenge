@@ -1,0 +1,8 @@
+# Homologation environment: PostgreSQL. All connection details come from the
+# environment; no defaults, so a misconfigured deploy fails fast at startup.
+spring:
+  datasource:
+    url: ${POSTGRES_URL}
+    username: ${POSTGRES_USER}
+    password: ${POSTGRES_PASSWORD}
+    driver-class-name: org.postgresql.Driver

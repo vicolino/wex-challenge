@@ -1,0 +1,43 @@
+# Build output
+build/
+out/
+target/
+bin/
+
+# Gradle
+.gradle/
+gradle-app.setting
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDEs
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.project
+.classpath
+.settings/
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Spring Boot
+HELP.md
+
+# Local H2 database files (local profile is file-backed)
+/data/
+*.mv.db
+
+pontos-entrevista.txt
+interview-cheatsheet.txt
+
+# Local helper scripts (not part of the deliverable)
+scripts/
+*.trace.db

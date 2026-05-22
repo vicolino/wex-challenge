@@ -1,0 +1,9 @@
+# Test profile: in-memory H2 in PostgreSQL-compatibility mode. Each test run
+# starts from a clean database; Flyway applies the same migration used in every
+# other environment, so the integration tests exercise the real schema.
+spring:
+  datasource:
+    url: jdbc:h2:mem:wex-test;MODE=PostgreSQL;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
